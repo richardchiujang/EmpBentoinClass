@@ -1,34 +1,63 @@
 <?php
 namespace App\Controllers;
 
+use App\Models\User;
+
 class AuthController
 {
     private \PDO $pdo;
+
+    // All demo accounts share this password (see spec 7.1)
+    private const DEMO_PASSWORD = '1234';
 
     public function __construct(\PDO $pdo)
     {
         $this->pdo = $pdo;
     }
 
+    /** GET /login — display login page */
+    public function showLogin(): void
+    {
+        header('Content-Type: text/html; charset=utf-8');
+        include __DIR__ . '/../Templates/login.php';
+    }
+
+    /** POST /login — validate credentials, write session */
     public function login(): void
     {
-        $input = json_decode(file_get_contents('php://input'), true);
-        if (!is_array($input) || empty($input['username'])) {
-            http_response_code(400);
-            echo json_encode(['error' => 'username required']);
+        $username = trim($_POST['username'] ?? '');
+        $password = $_POST['password'] ?? '';
+
+        if ($username === '' || $password !== self::DEMO_PASSWORD) {
+            $error = '帳號或密碼錯誤';
+            include __DIR__ . '/../Templates/login.php';
             return;
         }
 
-        $stmt = $this->pdo->prepare('SELECT user_id, username, full_name, dept_code, role FROM users WHERE username = :u LIMIT 1');
-        $stmt->execute([':u' => $input['username']]);
-        $user = $stmt->fetch();
+        $user = (new User($this->pdo))->findByUsername($username);
         if (!$user) {
-            http_response_code(401);
-            echo json_encode(['error' => 'invalid credentials']);
+            $error = '帳號不存在或已停用';
+            include __DIR__ . '/../Templates/login.php';
             return;
         }
 
-        // For demo: return user info (no password handling). Integrate real auth in production.
-        echo json_encode($user);
+        // Store user info in session
+        $_SESSION['username']     = $user['username'];
+        $_SESSION['display_name'] = $user['display_name'];
+        $_SESSION['role']         = $user['role'];
+        $_SESSION['user_id']      = $user['id'];
+        $_SESSION['auth_user']    = $user;
+
+        header('Location: /');
+        exit;
+    }
+
+    /** GET /logout */
+    public function logout(): void
+    {
+        session_destroy();
+        header('Location: /login');
+        exit;
     }
 }
+

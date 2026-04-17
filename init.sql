@@ -1,129 +1,231 @@
--- init.sql for tongxin-meal-system
--- Usage (PowerShell):
--- $env:PGPASSWORD='1234'; psql -h 127.0.0.1 -U postgres -f .\init.sql
+-- init.sql for 同心餐點費用申請系統 (sys_spec v2)
+-- Usage (PowerShell, recommended):
+--   $env:PGPASSWORD='1234'; psql -h 127.0.0.1 -U postgres -f .\init.sql
+-- Or via helper:
+--   python create_data.py --sql .\init.sql --host 127.0.0.1 --port 5432 --user postgres
 
--- Clean up existing objects (if any)
+-- ── Drop & recreate database ─────────────────────────────────────────────────
 DROP DATABASE IF EXISTS tongxin_meal;
 DROP ROLE IF EXISTS tongxin_admin;
-
--- Create an application role (password provided by user)
 CREATE ROLE tongxin_admin WITH LOGIN PASSWORD '1234';
 
 -- Create database owned by the app role
 CREATE DATABASE tongxin_meal OWNER tongxin_admin;
 
--- Note: do NOT use psql meta-commands like "\connect" when running via psycopg2.
--- The helper script will create the database first and then run the following statements
--- against the newly created database.
+-- Note: psycopg2 cannot run \c / \connect.  create_data.py handles the DB switch.
+-- When running via psql the \c below switches to the new database automatically.
+\c tongxin_meal
 
--- Ensure useful extensions
+-- ── Extensions & settings ────────────────────────────────────────────────────
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
-
--- Recommended settings
 ALTER DATABASE tongxin_meal SET client_encoding = 'UTF8';
 ALTER DATABASE tongxin_meal SET timezone = 'Asia/Taipei';
 
 -- Create master data tables
-CREATE TABLE departments (
-    dept_code VARCHAR(20) PRIMARY KEY,
-    dept_name VARCHAR(100) NOT NULL
+-- ── Sequence for request_no (format S260001) ────────────────────────────────
+DROP SEQUENCE IF EXISTS request_no_seq;
+CREATE SEQUENCE request_no_seq START 1;
+
+-- ── 單位主檔 ─────────────────────────────────────────────────────────────────
+CREATE TABLE units (
+    id        SERIAL PRIMARY KEY,
+    unit_name VARCHAR(100) NOT NULL,
+    unit_type VARCHAR(50)  NOT NULL   -- general / teaching / center
 );
 
+-- ── 餐點主檔 ─────────────────────────────────────────────────────────────────
+CREATE TABLE meals (
+    id       SERIAL PRIMARY KEY,
+    category VARCHAR(50)  NOT NULL,
+    name     VARCHAR(100) NOT NULL,
+    price    INTEGER      NOT NULL DEFAULT 0
+);
+
+-- ── 使用者主檔 (M02) ─────────────────────────────────────────────────────────
 CREATE TABLE users (
-    user_id SERIAL PRIMARY KEY,
-    username VARCHAR(50) NOT NULL,
-    full_name VARCHAR(100) NOT NULL,
-    dept_code VARCHAR(20) REFERENCES departments(dept_code),
-    extension VARCHAR(10),
-    role VARCHAR(20) DEFAULT 'applicant'
+    id               SERIAL PRIMARY KEY,
+    username         VARCHAR(50)  UNIQUE NOT NULL,
+    display_name     VARCHAR(100) NOT NULL,
+    role             VARCHAR(20)  NOT NULL,  -- staff/manager/restaurant/finance/admin
+    unit_id          INTEGER REFERENCES units(id),
+    manager_username VARCHAR(50),
+    is_active        BOOLEAN DEFAULT TRUE,
+    created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE TABLE meal_items (
-    item_id SERIAL PRIMARY KEY,
-    item_name VARCHAR(50) NOT NULL,
-    description VARCHAR(100),
-    standard_price DECIMAL(10,2) DEFAULT 0,
-    unit VARCHAR(10) DEFAULT '份'
+-- ── 申請單主檔 ───────────────────────────────────────────────────────────────
+CREATE TABLE requests (
+    id             SERIAL PRIMARY KEY,
+    request_no     VARCHAR(20),
+    status         VARCHAR(20)  NOT NULL DEFAULT 'draft',
+    applicant_id   INTEGER,     -- loosely references users.id
+    applicant_name VARCHAR(100) NOT NULL,
+    extension      VARCHAR(20),
+    unit_id        INTEGER REFERENCES units(id),
+    budget_source  VARCHAR(150),
+    meal_date      DATE,
+    meal_type      VARCHAR(20),  -- breakfast/lunch/afternoon_tea/dinner/other
+    meal_time      TIME,
+    meal_location  VARCHAR(200),
+    meal_reason    TEXT,
+    notes          TEXT,
+    next_operator  VARCHAR(100),  -- username of current required approver
+    processed_flag BOOLEAN DEFAULT FALSE,
+    version_no     INTEGER DEFAULT 1,
+    created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE TABLE budgets (
-    budget_code VARCHAR(50) PRIMARY KEY,
-    subject_name VARCHAR(100),
-    balance DECIMAL(15,2) DEFAULT 0
+-- ── 訂單明細 ─────────────────────────────────────────────────────────────────
+CREATE TABLE order_items (
+    id             SERIAL PRIMARY KEY,
+    request_id     INTEGER REFERENCES requests(id) ON DELETE CASCADE,
+    meal_id        INTEGER REFERENCES meals(id),
+    quantity       INTEGER NOT NULL DEFAULT 1,
+    payment_method VARCHAR(10) DEFAULT '自付',  -- 自付 / 招待
+    custom_price   INTEGER  -- NULL = use meals.price; set when category=其他
 );
 
--- Transactional tables
-CREATE TABLE order_headers (
-    order_no VARCHAR(20) PRIMARY KEY,
-    applicant_id INTEGER REFERENCES users(user_id),
-    dept_code VARCHAR(20) REFERENCES departments(dept_code),
-    apply_date DATE DEFAULT CURRENT_DATE,
-    meal_date DATE NOT NULL,
-    meal_time TIME NOT NULL,
-    meal_type VARCHAR(20),
-    location TEXT,
-    purpose TEXT,
-    budget_code VARCHAR(50) REFERENCES budgets(budget_code),
-    total_amount DECIMAL(15,2) DEFAULT 0,
-    status_code VARCHAR(2) DEFAULT '1',
-    current_handler_id INTEGER REFERENCES users(user_id),
-    remarks TEXT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE order_details (
-    detail_id SERIAL PRIMARY KEY,
-    order_no VARCHAR(20) REFERENCES order_headers(order_no) ON DELETE CASCADE,
-    item_id INTEGER REFERENCES meal_items(item_id),
-    quantity INTEGER DEFAULT 0,
-    price_per_unit DECIMAL(10,2) NOT NULL,
-    payment_method VARCHAR(10) DEFAULT '自付',
-    subtotal DECIMAL(15,2) NOT NULL
-);
-
-CREATE TABLE workflow_logs (
-    log_id SERIAL PRIMARY KEY,
-    order_no VARCHAR(20) REFERENCES order_headers(order_no),
-    sequence_no INTEGER NOT NULL,
+-- ── 簽辦歷程 (audit_logs) ────────────────────────────────────────────────────
+CREATE TABLE audit_logs (
+    id          SERIAL PRIMARY KEY,
+    request_id  INTEGER REFERENCES requests(id),
     action_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    status_code VARCHAR(2),
-    handler_id INTEGER REFERENCES users(user_id),
-    opinion TEXT
+    stage       VARCHAR(50),   -- 狀態中文標籤
+    operator    VARCHAR(100),  -- username or Agent name
+    comment     TEXT
 );
 
--- Grant privileges to application role
+-- ── 通知紀錄 ─────────────────────────────────────────────────────────────────
+CREATE TABLE notifications (
+    id          SERIAL PRIMARY KEY,
+    request_id  INTEGER REFERENCES requests(id),
+    message     TEXT,
+    target_role VARCHAR(50) DEFAULT 'staff',
+    read_flag   BOOLEAN DEFAULT FALSE,
+    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ── 簽核鏈設定 (M03) ─────────────────────────────────────────────────────────
+CREATE TABLE approval_steps (
+    id                SERIAL PRIMARY KEY,
+    step_order        INTEGER     NOT NULL,
+    operator_username VARCHAR(50) NOT NULL,
+    role              VARCHAR(20) NOT NULL,
+    is_active         BOOLEAN DEFAULT TRUE,
+    UNIQUE(step_order)
+);
+
+-- ── 狀態轉移審計 (M04) ───────────────────────────────────────────────────────
+CREATE TABLE request_transitions (
+    id          SERIAL PRIMARY KEY,
+    request_id  INTEGER NOT NULL REFERENCES requests(id) ON DELETE CASCADE,
+    from_status VARCHAR(50),
+    to_status   VARCHAR(50) NOT NULL,
+    operator    VARCHAR(100) NOT NULL,
+    comment     TEXT,
+    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ── Indexes (M05) ────────────────────────────────────────────────────────────
+CREATE INDEX idx_requests_status        ON requests(status);
+CREATE INDEX idx_requests_next_operator ON requests(next_operator);
+CREATE INDEX idx_requests_unit_id       ON requests(unit_id);
+CREATE INDEX idx_audit_logs_request_id  ON audit_logs(request_id);
+CREATE INDEX idx_notifications_request  ON notifications(request_id);
+CREATE INDEX idx_users_manager          ON users(manager_username);
+
+-- ── Privileges ───────────────────────────────────────────────────────────────
 GRANT ALL PRIVILEGES ON DATABASE tongxin_meal TO tongxin_admin;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO tongxin_admin;
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO tongxin_admin;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO tongxin_admin;
 
--- Insert sample master data and test records
-INSERT INTO departments (dept_code, dept_name) VALUES ('213000', '電算中心');
+-- ── Seed: units ──────────────────────────────────────────────────────────────
+INSERT INTO units (id, unit_name, unit_type) VALUES
+(1, '業務部',   'general'),
+(2, '教學部',   'teaching'),
+(3, '電算中心', 'center'),
+(4, '行政部',   'general'),
+(5, '供膳組',   'center'),
+(6, '財務部',   'general');
 
-INSERT INTO users (username, full_name, dept_code, extension) VALUES
-('yibei.xie', '謝依蓓', '213000', '7039'),
-('chengxun.lin', '林承訓', '213000', '7039'),
-('yongsen.liu', '劉永森', '213000', '1303'),
-('nianlong.wu', '吳年龍', '213000', '1304');
+-- ── Seed: meals (9 categories per spec 3.2) ──────────────────────────────────
+INSERT INTO meals (category, name, price) VALUES
+('便當',       '環保便當',      45),
+('茶水',       '紅茶飲料',     200),
+('中式快餐',   '中式快餐',     100),
+('點心',       '綜合點心',      30),
+('歐式自助餐', '歐式自助餐',   100),
+('早餐',       '早餐',          25),
+('午餐',       '午餐（打菜）',  45),
+('晚餐',       '晚餐（打菜）',  45),
+('其他',       '其他（自訂）',   0);
 
-INSERT INTO meal_items (item_name, description, standard_price, unit) VALUES
-('便當', '環保便當(45元)', 45, '份'),
-('茶水', '紅茶', 200, '人份'),
-('中式快餐', '每人份100元', 100, '份'),
-('點心', '三樣點心', 30, '份');
+-- ── Seed: users (M06) ────────────────────────────────────────────────────────
+INSERT INTO users (username, display_name, role, unit_id, manager_username) VALUES
+('admin',        '系統管理員', 'admin',       NULL, NULL),
+('restaurant01', '供膳審核員', 'restaurant',     5, NULL),
+('finance01',    '財務審核員', 'finance',        6, NULL),
+('manager01',    '業務主管',   'manager',        1, NULL),
+('manager02',    '教學主管',   'manager',        2, NULL),
+('manager03',    '電算主管',   'manager',        3, NULL),
+('manager04',    '行政主管',   'manager',        4, NULL),
+('manager05',    '供膳主管',   'manager',        5, NULL),
+('staff01',  '員工01', 'staff', 1, 'manager01'),
+('staff02',  '員工02', 'staff', 1, 'manager01'),
+('staff03',  '員工03', 'staff', 2, 'manager02'),
+('staff04',  '員工04', 'staff', 2, 'manager02'),
+('staff05',  '員工05', 'staff', 2, 'manager02'),
+('staff06',  '員工06', 'staff', 3, 'manager03'),
+('staff07',  '員工07', 'staff', 3, 'manager03'),
+('staff08',  '員工08', 'staff', 3, 'manager03'),
+('staff09',  '員工09', 'staff', 3, 'manager03'),
+('staff10',  '員工10', 'staff', 4, 'manager04'),
+('staff11',  '員工11', 'staff', 4, 'manager04'),
+('staff12',  '員工12', 'staff', 4, 'manager04'),
+('staff13',  '員工13', 'staff', 4, 'manager04'),
+('staff14',  '員工14', 'staff', 4, 'manager04'),
+('staff15',  '員工15', 'staff', 5, 'manager05'),
+('staff16',  '員工16', 'staff', 5, 'manager05'),
+('staff17',  '員工17', 'staff', 5, 'manager05'),
+('staff18',  '員工18', 'staff', 5, 'manager05'),
+('staff19',  '員工19', 'staff', 5, 'manager05'),
+('staff20',  '員工20', 'staff', 5, 'manager05')
+ON CONFLICT (username) DO UPDATE
+SET display_name     = EXCLUDED.display_name,
+    role             = EXCLUDED.role,
+    unit_id          = EXCLUDED.unit_id,
+    manager_username = EXCLUDED.manager_username,
+    is_active        = TRUE;
 
-INSERT INTO budgets (budget_code, subject_name, balance) VALUES
-('92213000-03-05', '電算中心計畫經費', 5000000);
+-- ── Seed: approval_steps (M07) ───────────────────────────────────────────────
+INSERT INTO approval_steps (step_order, operator_username, role) VALUES
+(1, 'manager01',    'manager'),
+(2, 'restaurant01', 'restaurant'),
+(3, 'finance01',    'finance')
+ON CONFLICT (step_order) DO UPDATE
+SET operator_username = EXCLUDED.operator_username,
+    role              = EXCLUDED.role,
+    is_active         = TRUE;
 
--- Example order matching provided spec (S920005)
-INSERT INTO order_headers (order_no, applicant_id, dept_code, meal_date, meal_time, meal_type, location, purpose, budget_code, total_amount, status_code)
-VALUES ('S920005', 2, '213000', '2003-08-14', '08:30:00', '早上', 'C304電腦教室', '電算中心暑期電腦教育訓練課程', '92213000-03-05', 200, '6');
+-- ── Demo request (for classroom display) ─────────────────────────────────────
+INSERT INTO requests (request_no, status, applicant_id, applicant_name, extension,
+                      unit_id, budget_source, meal_date, meal_type, meal_time,
+                      meal_location, meal_reason, notes, next_operator)
+VALUES ('S260001', 'approved', 9, '員工01', '7039',
+        3, '電算中心計畫經費-2026', '2026-04-20', 'breakfast', '08:30:00',
+        'C304電腦教室', '電算中心暑期電腦教育訓練課程', '請提供環保杯', NULL);
 
-INSERT INTO order_details (order_no, item_id, quantity, price_per_unit, payment_method, subtotal)
-VALUES ('S920005', 2, 100, 2, '招待', 200);
+INSERT INTO order_items (request_id, meal_id, quantity, payment_method)
+SELECT id, 2, 100, '招待' FROM requests WHERE request_no = 'S260001';
 
-INSERT INTO workflow_logs (order_no, sequence_no, action_date, status_code, handler_id, opinion) VALUES
-('S920005', 1, '2003-08-06 09:00:00', '1', 2, '送案給劉永森'),
-('S920005', 2, '2003-08-06 14:00:00', '2', 3, '敬表同意');
+INSERT INTO audit_logs (request_id, stage, operator, comment)
+SELECT id, '已送案', '員工01',       '送案給主管審核'   FROM requests WHERE request_no = 'S260001'
+UNION ALL
+SELECT id, '審核中', 'manager01',    '敬表同意'         FROM requests WHERE request_no = 'S260001'
+UNION ALL
+SELECT id, '審核中', 'restaurant01', '確認供膳'         FROM requests WHERE request_no = 'S260001'
+UNION ALL
+SELECT id, '已核決', 'finance01',    '預算確認，核准'   FROM requests WHERE request_no = 'S260001';
 
 -- End of init.sql
